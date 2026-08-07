@@ -156,11 +156,11 @@
     </div>
 
     <!-- 数字人角色：显示在页面右侧，模拟效果图中的陪伴形象。
-         当前为单张静态角色图（avatar.png），作为背景融入页面。
-         —— 后续将替换为 Live2D 模型驱动（见根目录 Live2D 素材获取说明 md）。 -->
-    <div id="digital-human" class="digital-human" aria-hidden="true">
-      <img class="digital-human-img" src="avatar.png" alt="" draggable="false">
-    </div>
+         采用"无缝视频状态机"（见 video-state-machine.js）：
+         两个 <video> 轨道在同一位置层叠，随会话状态在
+         idle(待机) / thinking(思考) / speaking(说话) 三个动作视频间淡入淡出切换。
+         <video> 轨道由 JS 动态创建并填充，避免缺失素材时出现破图/黑框。 -->
+    <div id="digital-human" class="digital-human" aria-hidden="true"></div>
 
     <!-- 底部实时字幕：显示最近一句对话文字 -->
     <div id="subtitle-bar" class="subtitle-bar" aria-hidden="true"></div>

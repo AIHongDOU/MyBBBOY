@@ -22,8 +22,13 @@ if not exist "%PYTHON%" (
     exit /b 1
 )
 
-REM DeepSeek API Key (the openai-compatible backend reads this as the default api_key)
-set "OPENAI_API_KEY=sk-862ed5f6fcd1460d915b3010d44b2237"
+REM DeepSeek API Key：从系统环境变量 OPENAI_API_KEY 读取，避免密钥硬编码进仓库泄露。
+REM 使用前请先在系统/用户环境变量中设置 OPENAI_API_KEY（值为你的 DeepSeek API Key）。
+if "%OPENAI_API_KEY%"=="" (
+    echo [ERROR] 未检测到环境变量 OPENAI_API_KEY，请先设置后再启动。
+    pause
+    exit /b 1
+)
 
 echo Starting the realtime speech service, please wait (first run downloads STT/TTS models)...
 "%PYTHON%" -m speech_to_speech.s2s_pipeline ^

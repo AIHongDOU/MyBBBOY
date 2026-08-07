@@ -2743,14 +2743,19 @@ body.cam-on .footer {
   aspect-ratio: 1085 / 1450;
   overflow: hidden;
 }
-/* 单张静态角色图：contain 保持完整人物、不裁切，蒙版向背景渐入自然融入 */
-.digital-human-img {
+/* 视频轨道：两个 <video> 在同一位置层叠，默认透明；
+   .active 时 opacity:1 淡入，非 active 淡出，形成无缝切换。
+   蒙版渐入让角色边缘自然融入背景（左侧/顶部渐隐，底部保留）。 */
+.vsm-video {
   position: absolute;
   inset: 0;
   width: 100%;
   height: 100%;
+  /* contain 保持完整人物、不裁切，人物自然居中且清晰 */
   object-fit: contain;
   object-position: center;
+  opacity: 0;
+  transition: opacity 0.4s ease-in-out;
   /* 蒙版渐入：左侧（中央按钮一侧）渐隐最深，顶部柔和过渡；
      底部保留（手肘落在屏幕底部，不需渐隐） */
   -webkit-mask-image:
@@ -2761,6 +2766,9 @@ body.cam-on .footer {
     linear-gradient(to right, rgba(0,0,0,0) 0%, rgba(0,0,0,0.4) 20%, rgba(0,0,0,1) 50%),
     linear-gradient(to top,    rgba(0,0,0,0) 0%, rgba(0,0,0,0.5) 18%, rgba(0,0,0,1) 40%);
   mask-composite: intersect;
+}
+.vsm-video.active {
+  opacity: 1;
 }
 
 /* 让主内容区（标题栏 / 中央球体 / 页脚）浮在数字人背景层之上 */
@@ -2803,7 +2811,7 @@ body.cam-on .footer {
     bottom: 0;
     height: 78vh;
   }
-  .digital-human-img {
+  .vsm-video {
     object-position: center;
     -webkit-mask-image:
       linear-gradient(to right, rgba(0,0,0,0) 0%, rgba(0,0,0,0.5) 30%, rgba(0,0,0,1) 62%),

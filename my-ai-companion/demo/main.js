@@ -22,6 +22,7 @@ import { S2sRtcRealtimeClient } from "./rtc/s2s-rtc-client.js";
 import { $, truncateError, DEBUG } from "./ui/dom.js";
 import { ChatView } from "./ui/chat.js";
 import { Account } from "./ui/account.js";
+import { VideoStateMachine } from "./video-state-machine.js";
 
 const DEFAULT_VOICE = "Aiden";
 const DEFAULT_INSTRUCTIONS =
@@ -72,6 +73,11 @@ const GATE_DEFAULT_DB = -50; // first-run default: a gentle gate, enabled
 function gateParams(thresholdDb) {
   return { enabled: thresholdDb > GATE_OFF_DB, thresholdDb };
 }
+
+// 视频素材缓存打破：静态服务器（python http.server）不发送缓存控制头，浏览器会
+// 长期缓存视频文件，导致改了素材文件后页面仍显示旧视频。给每个视频 URL 追加一个
+// 基于页面加载时刻的版本号，保证每次刷新都能拉到最新的素材。
+const ASSET_BUST = `?v=${Date.now()}`;
 
 // ── Tools ─────────────────────────────────────────────────────────────────
 // Function tools we declare to the backend. The model decides when to call
@@ -328,6 +334,31 @@ function updateSubtitle(text) {
 let currentState = "idle";
 let settings = loadSettings();
 
+// 数字人无缝视频状态机：随会话状态在 idle(待机) / thinking(思考) / speaking(说话)
+// 三个动作视频间淡入淡出切换。见 video-state-machine.js。
+const videoStateMachine = new VideoStateMachine(
+  /** @type {HTMLElement} */ ($("#digital-human")),
+  {
+    // idle 仅作待机序列不可用时的兜底；实际待机走下方 idleVideos 序列
+    idle: `data/thinking1.mp4${ASSET_BUST}`,
+    thinking: `data/thinking.mp4${ASSET_BUST}`,
+    speaking: `data/speaking.mp4${ASSET_BUST}`,
+  },
+  // 待机序列：三段首尾帧相同的待机动画，按顺序无缝循环播放，形成连贯待机效果
+  [`data/idle-1.mp4${ASSET_BUST}`, `data/idle-2.mp4${ASSET_BUST}`, `data/idle-3.mp4${ASSET_BUST}`],
+);
+
+/** 会话状态 -> 视频状态机状态。
+ *  - processing（等待 LLM 响应）→ thinking（思考中）
+ *  - ai-speaking（TTS 说话中）→ speaking（说话中）
+ *  - 其余（idle/connecting/listening/user-speaking 等）→ idle（待机）
+ * @param {AppState} state */
+function videoStateFor(state) {
+  if (state === "processing") return "thinking";
+  if (state === "ai-speaking") return "speaking";
+  return "idle";
+}
+
 // ── Connection target ────────────────────────────────────────────────────────
 // Three modes, decided by the deploy via /api/config:
 //   • SPEECH_TO_SPEECH_URL set -> direct mode pinned by the deploy: the browser
@@ -439,6 +470,8 @@ function syncMicMuteState() {
 /** @param {AppState} next */
 function setState(next) {
   currentState = next;
+  // 驱动数字人视频状态机：processing→thinking，ai-speaking→speaking，其余→idle
+  videoStateMachine.switchState(videoStateFor(next));
   const view = STATE_VIEWS[next];
   circleBtn.disabled = view.disabled;
   circleBtn.className = `circle ${STATE_CLASS[next]}`;
@@ -1729,6 +1762,13 @@ function onFatalError(err) {
 
 setState("idle");
 chat.renderEmptyState();
+
+// 某些浏览器（如 Edge）的自动播放策略会暂停 muted 视频，导致角色停在黑屏。
+// 首次与页面交互（鼠标/触摸/键盘）时恢复角色视频播放，确保角色一定可见。
+const ensureVideoPlaying = () => videoStateMachine.ensurePlaying();
+window.addEventListener("pointerdown", ensureVideoPlaying, { once: true });
+window.addEventListener("touchstart", ensureVideoPlaying, { once: true });
+window.addEventListener("keydown", ensureVideoPlaying, { once: true });
 initGateArc();
 void fetchConfig();
 // Start the webcam as soon as the user lands (camera tool defaults on), and
