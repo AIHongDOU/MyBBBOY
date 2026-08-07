@@ -1,9 +1,15 @@
 @echo off
 REM Switch cmd to UTF-8 so the Chinese init_chat_prompt below is parsed correctly.
 chcp 65001 >nul
+
 REM ============================================================
 REM Launch the Hugging Face speech-to-speech realtime service (DeepSeek) v2
 REM ------------------------------------------------------------
+REM Use the HF mirror (replace huggingface.co) for any model downloads, and
+REM keep the hub offline so cached models (Smart Turn, etc.) load without
+REM needing to reach huggingface.co. Edge-TTS and DeepSeek use their own APIs.
+set "HF_ENDPOINT=https://hf-mirror.com"
+set "HF_HUB_OFFLINE=1"
 REM Summary:
 REM   - LLM: DeepSeek official OpenAI-compatible endpoint (chat-completions)
 REM   - STT: faster-whisper (CTranslate2, much faster on CPU than openai/whisper-small)
@@ -14,18 +20,20 @@ REM   - Service listens on ws://localhost:8765/v1/realtime
 REM   - Browser demo connects to this service via SPEECH_TO_SPEECH_URL
 REM ============================================================
 
-REM Use the project conda env env-myboy Python
-set "PYTHON=%~dp0env-myboy\python.exe"
+REM Use the project env env-myboy Python. Support both conda-style
+REM (env-myboy\python.exe) and standard venv (env-myboy\Scripts\python.exe) layouts.
+set "PYTHON=%~dp0env-myboy\Scripts\python.exe"
+if not exist "%PYTHON%" set "PYTHON=%~dp0env-myboy\python.exe"
 if not exist "%PYTHON%" (
     echo [ERROR] env-myboy Python not found. Please create the env-myboy environment first.
     pause
     exit /b 1
 )
 
-REM DeepSeek API Key：从系统环境变量 OPENAI_API_KEY 读取，避免密钥硬编码进仓库泄露。
-REM 使用前请先在系统/用户环境变量中设置 OPENAI_API_KEY（值为你的 DeepSeek API Key）。
+REM DeepSeek API Key: read from the OPENAI_API_KEY env var (not hardcoded).
+REM Set OPENAI_API_KEY in your user/system environment before running.
 if "%OPENAI_API_KEY%"=="" (
-    echo [ERROR] 未检测到环境变量 OPENAI_API_KEY，请先设置后再启动。
+    echo [ERROR] OPENAI_API_KEY is not set. Set it first, then start again.
     pause
     exit /b 1
 )
@@ -34,7 +42,7 @@ echo Starting the realtime speech service, please wait (first run downloads STT/
 "%PYTHON%" -m speech_to_speech.s2s_pipeline ^
     --mode realtime ^
     --stt faster-whisper ^
-    --faster_whisper_stt_model_name small ^
+    --faster_whisper_stt_model_name "%~dp0models\faster-whisper-small" ^
     --faster_whisper_stt_device cpu ^
     --faster_whisper_stt_compute_type int8 ^
     --faster_whisper_stt_gen_language zh ^

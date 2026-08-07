@@ -4,6 +4,9 @@ my-ai-companion/env-myboy/
 # pip 缓存（体量大，不纳入版本控制）
 my-ai-companion/.pipcache/
 
+# 本地模型权重（体量大，不纳入版本控制，由脚本自动下载）
+my-ai-companion/models/
+
 # ── Python ────────────────────────────────────────────────
 __pycache__/
 *.py[codz]

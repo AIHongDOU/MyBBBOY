@@ -10,8 +10,9 @@ REM     ws://localhost:8765/v1/realtime (start it first via start_realtime.bat)
 REM   - Simple static server (python http.server), no build step needed.
 REM ============================================================
 
-REM Use the project conda env Python if available, else fall back to system python.
-set "PYTHON=%~dp0env-myboy\python.exe"
+REM Use the project env Python if available, else fall back to system python.
+set "PYTHON=%~dp0env-myboy\Scripts\python.exe"
+if not exist "%PYTHON%" set "PYTHON=%~dp0env-myboy\python.exe"
 if not exist "%PYTHON%" set "PYTHON=python"
 
 REM Move into the demo folder so the page assets resolve correctly.
