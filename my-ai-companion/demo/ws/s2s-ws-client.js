@@ -69,6 +69,16 @@
  *   before it's sent. Tunable live via `setNoiseGate`.
  * @property {string} [audioOutputId] MediaDeviceInfo.deviceId for speakers.
  *   Applied via AudioContext.setSinkId when the browser supports it.
+ * @property {"local" | "openai" | "zhipu" | "doubao"} [provider] Backend dialect:
+ *   "local" (the s2s simulator), "openai" (official Realtime API), "zhipu" (智谱
+ *   GLM-Realtime) or "doubao" (智谱 GLM 作对话大脑 + 豆包 TTS 作御姐语音输出).
+ *   Only the session payload shape differs; defaults to "local".
+ * @property {string} [model] Model name for remote backends (e.g. 智谱
+ *   "glm-realtime"). Sent in the session payload; ignored by the local s2s.
+ * @property {string} [doubaoToken] 豆包 TTS Access Token（provider="doubao" 时）。
+ * @property {string} [doubaoResourceId] 豆包 TTS 资源 ID（默认 seed-tts-2.0）。
+ * @property {string} [doubaoVoice] 豆包 TTS 音色 ID（如御姐）。
+ * @property {number} [doubaoSampleRate] 豆包 TTS 输出采样率（默认 24000）。
  *
  * @typedef {Object} NoiseGate
  * @property {boolean} enabled
@@ -94,6 +104,7 @@ import {
 } from "./codec.js";
 import { OrbVisualiser, VIS_FFT_SIZE } from "./orb-visualizer.js";
 import { SentAudioRecorder } from "./user-audio-recorder.js";
+import { DoubaoTtsClient } from "./doubao-tts.js";
 
 /** Build an Error carrying a `code` (and optional extra fields) so callers can
  *  branch on the failure kind: "limit" | "queue-full" | "queue-expired" | "aborted".
@@ -110,7 +121,14 @@ function _codedError(message, code, extra) {
 // native pipeline rate. We don't (can't) override it via `audio.output.format`
 // because the server's pydantic validator rejects the whole `session.update`
 // as soon as a sub-field shape it doesn't know about appears.
-const OUTPUT_SAMPLE_RATE = 16000;
+//
+// The local s2s server emits 16 kHz PCM, but both OpenAI Realtime and 智谱
+// GLM-Realtime emit **24 kHz** PCM. Playing 24 kHz data at 16 kHz makes speech
+// ~1.5x too slow/low (sounds male) and the resampling interpolation causes
+// audible beeping artifacts. So the playback input rate must match the active
+// backend's output rate.
+const LOCAL_OUTPUT_SAMPLE_RATE = 16000;
+const REMOTE_OUTPUT_SAMPLE_RATE = 24000;
 const MIC_CHUNK_MS = 40;
 
 export class S2sWsRealtimeClient extends EventTarget {
@@ -123,6 +141,24 @@ export class S2sWsRealtimeClient extends EventTarget {
     this._tools = options.tools ?? [];
     /** @type {string} Direct realtime WS URL (set => skip the LB session POST). */
     this._directUrl = options.directUrl ?? "";
+    /** @type {"local" | "openai" | "zhipu" | "doubao"} Backend dialect: the local
+     *  s2s simulator, a remote OpenAI-compatible Realtime API (official OpenAI
+     *  or 智谱 GLM-Realtime), or 智谱大脑 + 豆包 TTS 语音输出. */
+    this._provider = ["openai", "zhipu", "doubao"].includes(options.provider)
+      ? options.provider
+      : "local";
+    /** @type {string} 豆包 TTS Access Token（provider="doubao"）。 */
+    this._doubaoToken = options.doubaoToken ?? "";
+    /** @type {string} 豆包 TTS 资源 ID。 */
+    this._doubaoResourceId = options.doubaoResourceId ?? "seed-tts-2.0";
+    /** @type {string} 豆包 TTS 音色 ID（御姐）。 */
+    this._doubaoVoice = options.doubaoVoice ?? "";
+    /** @type {number} 豆包 TTS 输出采样率。 */
+    this._doubaoSampleRate = options.doubaoSampleRate ?? 24000;
+    /** @type {DoubaoTtsClient | null} 豆包 TTS 客户端（provider="doubao" 时创建）。 */
+    this._doubaoTts = null;
+    /** @type {number} 已交给豆包 TTS、尚未完成合成/播放的句子数。 */
+    this._doubaoPending = 0;
     /** @type {string} Where to POST for the session handshake. Prefer the
      *  explicit `sessionUrl`; fall back to `<loadBalancerUrl>/session` for callers
      *  that still pass the LB address directly. */
@@ -196,10 +232,30 @@ export class S2sWsRealtimeClient extends EventTarget {
     // and replayed, one at a time, as each response.done frees the slot.
     this._openResponses = 0;
     this._createInFlight = false;
+    /** @type {number | null} Server-VAD fallback: armed when the user's turn
+     * ends (speech_stopped). If the server does not auto-create a response
+     * (its `create_response:true` VAD is unreliable), we fire a client-side
+     * response.create after a short grace period so the user always gets a
+     * reply. Cleared on the first response.created. */
+    this._createFallbackTimer = null;
     /** @type {{ image?: string }[]} Pending response.create payloads, one per
      * queued requestResponse(). A payload may carry an image to send just
      * before its create (so the frame travels with the create, not eagerly). */
     this._createQueue = [];
+    // ── Client-side VAD ──────────────────────────────────────────────────
+    // The server's own VAD may never flag speech (speech_started/stopped),
+    // especially for some realtime backends. We therefore ALSO watch the raw
+    // mic RMS (from the mic-capture worklet) and locally detect the user's
+    // turn, so we can commit the buffer and request a response ourselves.
+    this._cvad = {
+      enabled: options.clientVad !== false,
+      speaking: false,        // user currently inside a talk run (has spiked since start)
+      talkStart: 0,           // performance.now() when the talk run began
+      lastVoice: 0,           // performance.now() of the last frame with RMS >= threshold
+      hangMs: options.vadHangMs ?? 700,   // silence needed to mark the turn ended
+      minTalkMs: options.vadMinTalkMs ?? 350, // min talk length to count as a turn
+      threshold: options.vadThreshold ?? 0.012, // RMS (0..1) to count as speech
+    };
     /** @type {Promise<void> | null} */
     this._readyPromise = null;
     this._sessionConfigured = false;
@@ -501,6 +557,7 @@ export class S2sWsRealtimeClient extends EventTarget {
       } else if (data?.kind === "level") {
         // Raw pre-gate mic RMS for the Settings meter.
         this.dispatchEvent(new CustomEvent("input-level", { detail: { rms: data.rms } }));
+        this._onClientVadLevel(data.rms);
       }
     };
     // Push the initial gate config now that the worklet exists.
@@ -524,7 +581,12 @@ export class S2sWsRealtimeClient extends EventTarget {
       numberOfOutputs: 1,
       outputChannelCount: [1],
     });
-    playbackNode.port.postMessage({ kind: "config", inputRate: OUTPUT_SAMPLE_RATE });
+    const outputRate = this._provider === "local"
+      ? LOCAL_OUTPUT_SAMPLE_RATE
+      : this._provider === "doubao"
+        ? this._doubaoSampleRate
+        : REMOTE_OUTPUT_SAMPLE_RATE;
+    playbackNode.port.postMessage({ kind: "config", inputRate: outputRate });
     playbackNode.port.onmessage = (e) => this._onPlaybackMessage(e.data);
 
     // Output analyser sits between the playback worklet and the speakers.
@@ -601,6 +663,63 @@ export class S2sWsRealtimeClient extends EventTarget {
   }
 
   /**
+   * Client-side VAD. The raw pre-gate mic RMS arrives every ~40 ms. We track
+   * talk runs locally and, once the user has been silent long enough after a
+   * real utterance, we commit the input buffer and request a response — so the
+   * system answers even when the server's own VAD never flags speech.
+   * @param {number} rms 0..1 raw mic RMS
+   */
+  _onClientVadLevel(rms) {
+    const cv = this._cvad;
+    if (!cv.enabled || !this._sessionConfigured) return;
+    if (this._ws?.readyState !== WebSocket.OPEN || this._muted) {
+      cv.speaking = false;
+      return;
+    }
+    const now = performance.now();
+    if (rms >= cv.threshold) {
+      // Voice frame — (re)open or extend the talk run.
+      if (!cv.speaking) {
+        cv.speaking = true;
+        cv.talkStart = now;
+      }
+      cv.lastVoice = now;
+    } else if (cv.speaking) {
+      // Silence frame. Only end the turn once the silence has persisted for
+      // `hangMs` (so word gaps don't count as "I'm done"), and the run itself
+      // was longer than `minTalkMs` (so a stray blip isn't a turn).
+      if (now - cv.lastVoice >= cv.hangMs) {
+        const talkMs = cv.lastVoice - cv.talkStart;
+        cv.speaking = false;
+        if (talkMs >= cv.minTalkMs) {
+          this._onClientVadTurnEnd(talkMs);
+        } else if (this._debug) {
+          console.debug(`[ws] client-VAD: talk too short (${talkMs.toFixed(0)}ms); ignored`);
+        }
+      }
+    }
+  }
+
+  /**
+   * The client decided the user finished a turn. Commit the buffered audio and
+   * ask for a response, mirroring what server VAD would normally do.
+   * @param {number} talkMs
+   */
+  _onClientVadTurnEnd(talkMs) {
+    if (this._debug) console.debug(`[ws] client-VAD detected turn end (${talkMs.toFixed(0)}ms); committing`);
+    try { this._send({ type: "input_audio_buffer.commit" }); } catch {}
+    // Reuse the server-VAD fallback path: if no response becomes active within
+    // 1.2s, fire a response.create ourselves.
+    if (this._createFallbackTimer !== null) clearTimeout(this._createFallbackTimer);
+    this._createFallbackTimer = setTimeout(() => {
+      this._createFallbackTimer = null;
+      if (this._responseActive()) return;
+      if (this._debug) console.debug("[ws] client-VAD: server ignored commit; sending response.create");
+      this.requestResponse();
+    }, 1200);
+  }
+
+  /**
    * Mic worklet just sent us a ~40 ms PCM16 16 kHz mono chunk.
    * Base64-encode and forward via the WS.
    * @param {ArrayBuffer} pcm16Buffer
@@ -658,6 +777,9 @@ export class S2sWsRealtimeClient extends EventTarget {
         // out). We only push the user-tunable bits: voice + instructions.
         this._sendSessionUpdate();
         this._sessionConfigured = true;
+        // "doubao" 模式：对话大脑是智谱 GLM（上面的 session 已配置），语音输出
+        // 加接豆包 TTS。GLM 自带的音频会被丢弃，文本转交豆包用御姐音色合成。
+        if (this._provider === "doubao") this._setupDoubaoTts();
         // The s2s server does not echo session.updated. WebSocket messages are
         // ordered, so this hidden item and response.create are handled only
         // after the session.update sent immediately above.
@@ -705,11 +827,26 @@ export class S2sWsRealtimeClient extends EventTarget {
           }));
         }
         if (this._status === "user-speaking") this._setStatus("processing");
+        // Server-VAD fallback: many Realtime backends only auto-create a
+        // response when their VAD flags speech; if the user's turn ends but
+        // the server never creates one, fire a client-side response.create so
+        // the user still gets a reply. Cleared in response.created.
+        if (this._createFallbackTimer !== null) clearTimeout(this._createFallbackTimer);
+        this._createFallbackTimer = setTimeout(() => {
+          this._createFallbackTimer = null;
+          if (this._responseActive()) return; // server already created one
+          if (this._debug) console.debug("[ws] server did not auto-create a response; sending response.create");
+          this.requestResponse();
+        }, 1200);
         break;
 
       case "response.created":
         // A response now owns the slot — count it and clear our create guard
         // (this confirms either our create or a server-initiated one).
+        if (this._createFallbackTimer !== null) {
+          clearTimeout(this._createFallbackTimer);
+          this._createFallbackTimer = null;
+        }
         this._openResponses++;
         this._createInFlight = false;
         if (this._status === "connected" || this._status === "user-speaking") {
@@ -725,12 +862,15 @@ export class S2sWsRealtimeClient extends EventTarget {
 
       case "response.audio.delta":
       case "response.output_audio.delta": {
-        this._pushAudioDelta(event.delta);
-        const rid = event.response_id ?? event.response?.id;
-        if (rid) this._audibleResponses.add(rid);
-        if (!this._aiSpeaking) {
-          this._aiSpeaking = true;
-          this._markAudible();
+        if (this._provider !== "doubao") {
+          // 豆包模式下丢弃智谱 GLM 自带的音频：语音由豆包 TTS 合成。
+          this._pushAudioDelta(event.delta);
+          const rid = event.response_id ?? event.response?.id;
+          if (rid) this._audibleResponses.add(rid);
+          if (!this._aiSpeaking) {
+            this._aiSpeaking = true;
+            this._markAudible();
+          }
         }
         break;
       }
@@ -748,7 +888,11 @@ export class S2sWsRealtimeClient extends EventTarget {
         // This response freed the slot (completion OR cancellation both arrive
         // as response.done). Decrement and, if a create was waiting, replay it.
         this._openResponses = Math.max(0, this._openResponses - 1);
-        if (this._status === "ai-speaking" || this._status === "processing") {
+        // 豆包模式：语音由豆包 TTS 异步合成，response.done 时可能仍有句子在播，
+        // 此时保持 ai-speaking，等豆包全部播完再由 _afterDoubaoSpeaks 收敛。
+        if (this._provider === "doubao" && this._doubaoPending > 0) {
+          if (this._status === "processing") this._setStatus("ai-speaking");
+        } else if (this._status === "ai-speaking" || this._status === "processing") {
           this._setStatus("connected");
         }
         // A response closes here for BOTH normal completion and cancellation
@@ -870,6 +1014,8 @@ export class S2sWsRealtimeClient extends EventTarget {
         if (segment) {
           const prev = this._asstFullByResp.get(rid) || "";
           this._asstFullByResp.set(rid, prev ? `${prev} ${segment}` : segment);
+          // 豆包模式：把每一句完整文本交给豆包 TTS 合成御姐语音。
+          this._speakWithDoubao(segment);
         }
         const full = this._asstFullByResp.get(rid) || "";
         if (full) {
@@ -925,6 +1071,90 @@ export class S2sWsRealtimeClient extends EventTarget {
     this._playbackNode.port.postMessage({ kind: "audio", samples }, [samples.buffer]);
   }
 
+  // ── 豆包 TTS 语音输出（provider="doubao"）─────────────────────────────────
+  // 对话大脑是智谱 GLM（较难干预音色），语音输出换用豆包 TTS 以支持御姐音色。
+  // 智谱返回的文本逐句转交豆包合成；GLM 自带的音频在 _onWsMessage 里被丢弃。
+
+  /** 创建并连接豆包 TTS 客户端，把它的 PCM 接到播放管线。 */
+  _setupDoubaoTts() {
+    if (!this._doubaoToken) {
+      console.warn("[ws] doubao: missing doubaoToken, TTS disabled");
+      return;
+    }
+    if (this._doubaoTts) return;
+    const tts = new DoubaoTtsClient({
+      token: this._doubaoToken,
+      resourceId: this._doubaoResourceId,
+      speaker: this._doubaoVoice,
+      format: "pcm",
+      sampleRate: this._doubaoSampleRate,
+    });
+    this._doubaoTts = tts;
+    tts.addEventListener("sentence-start", () => {
+      if (!this._aiSpeaking) {
+        this._aiSpeaking = true;
+        this._markAudible();
+      }
+    });
+    tts.addEventListener("audio", (e) => {
+      const pcm = /** @type {CustomEvent<{ pcm: ArrayBuffer }>} */ (e).detail.pcm;
+      console.info("[ws] doubao TTS audio chunk:", pcm.byteLength, "bytes");
+      this._pushDoubaoPcm(pcm);
+    });
+    tts.addEventListener("sentence-end", () => {
+      this._doubaoPending = Math.max(0, this._doubaoPending - 1);
+      this._afterDoubaoSpeaks();
+    });
+    tts.addEventListener("error", (e) => {
+      const detail = /** @type {CustomEvent<{ error: unknown }>} */ (e).detail;
+      console.warn("[ws] doubao TTS error:", detail.error);
+    });
+    tts.addEventListener("connect", () => {
+      console.info("[ws] doubao TTS connected (ready)");
+    });
+    tts.connect().then(
+      () => console.info("[ws] doubao TTS connect resolved"),
+      (err) => console.warn("[ws] doubao TTS connect failed:", err),
+    );
+  }
+
+  /** 把一句智谱回复文本交给豆包 TTS 合成并播放。 */
+  _speakWithDoubao(segment) {
+    if (this._provider !== "doubao") {
+      console.warn("[ws] doubao: _speakWithDoubao but provider != doubao");
+      return;
+    }
+    if (!this._doubaoTts) {
+      console.warn("[ws] doubao: TTS not connected, dropping segment:", segment);
+      return;
+    }
+    console.info("[ws] doubao synthesize:", segment);
+    this._doubaoPending++;
+    this._doubaoTts.synthesize(segment);
+  }
+
+  /** 豆包返回的 PCM16 字节 -> Float32 -> 播放 worklet。 */
+  /** @param {ArrayBuffer} pcm */
+  _pushDoubaoPcm(pcm) {
+    if (!this._playbackNode || !pcm || !pcm.byteLength) return;
+    const view = new DataView(pcm);
+    const samples = new Float32Array(pcm.byteLength / 2);
+    for (let i = 0; i < samples.length; i++) {
+      const s = view.getInt16(i * 2, true);
+      samples[i] = s < 0 ? s / 0x8000 : s / 0x7fff;
+    }
+    this._playbackNode.port.postMessage({ kind: "audio", samples }, [samples.buffer]);
+  }
+
+  /** 豆包语音结束时的状态收敛：一句话播完且没有残留时回到 connected。 */
+  _afterDoubaoSpeaks() {
+    if (this._doubaoPending > 0) return; // 还有句子在排/播
+    this._aiSpeaking = false;
+    if (this._status === "ai-speaking" || this._status === "processing") {
+      this._setStatus("connected");
+    }
+  }
+
   /** @param {CloseEvent} ev */
   _onWsClose(ev) {
     console.log("[ws] socket closed:", ev.code, ev.reason);
@@ -950,13 +1180,30 @@ export class S2sWsRealtimeClient extends EventTarget {
     // validator on the server rejects the whole event if any unknown or
     // future-shaped sub-field shows up.
     /** @type {Record<string, any>} */
-    const session = {
-      type: "realtime",
-      instructions: this.options.instructions,
-      audio: {
-        output: { voice: this.options.voice },
-      },
-    };
+    const session = { instructions: this.options.instructions };
+    if (this._provider === "openai") {
+      // Official OpenAI Realtime GA session: no `type` field; pin the audio
+      // format so the worklets (16 kHz in / 24 kHz out PCM16) match the API
+      // defaults exactly, and map the chosen voice to an official voice.
+      session.audio = {
+        input: { format: "pcm16", sample_rate: 16000 },
+        output: { format: "pcm16", sample_rate: 24000, voice: this.options.voice },
+      };
+    } else if (this._provider === "zhipu" || this._provider === "doubao") {
+      // 智谱 GLM-Realtime: OpenAI-compatible events, but the session uses flat
+      // fields. Input is 16 kHz PCM16 ("pcm16" implies the sample rate), output
+      // is 24 kHz PCM. Voice is a 智谱-specific name at the top level.
+      // "doubao" 复用同一对话大脑（智谱），只是语音输出改由豆包 TTS 承担。
+      session.model = this.options.model || "glm-realtime";
+      session.voice = this.options.voice;
+      session.input_audio_format = "pcm16";
+      session.output_audio_format = "pcm";
+      session.turn_detection = { type: "server_vad" };
+      session.beta_fields = { chat_mode: "audio" };
+    } else {
+      session.type = "realtime";
+      session.audio = { output: { voice: this.options.voice } };
+    }
     // Tools are declared here; the backend already accepts them in
     // session.update and emits response.function_call_arguments.done when the
     // model decides to call one. Only include the keys when we actually have
@@ -972,10 +1219,17 @@ export class S2sWsRealtimeClient extends EventTarget {
   /** @param {{ voice?: string; instructions?: string }} patch */
   updateSession(patch) {
     /** @type {Record<string, any>} */
-    const session = { type: "realtime" };
+    const session = {};
+    if (this._provider === "local") session.type = "realtime";
     if (patch.instructions) session.instructions = patch.instructions;
-    if (patch.voice) session.audio = { output: { voice: patch.voice } };
-    if (Object.keys(session).length > 1) {
+    if (patch.voice) {
+      if (this._provider === "zhipu" || this._provider === "doubao") {
+        session.voice = patch.voice;
+      } else {
+        session.audio = { output: { voice: patch.voice } };
+      }
+    }
+    if (Object.keys(session).length > (this._provider === "local" ? 1 : 0)) {
       this._send({ type: "session.update", session });
     }
   }
@@ -988,10 +1242,12 @@ export class S2sWsRealtimeClient extends EventTarget {
    */
   setTools(tools) {
     this._tools = tools;
-    this._send({
-      type: "session.update",
-      session: { type: "realtime", tools, tool_choice: tools.length ? "auto" : "none" },
-    });
+    /** @type {Record<string, any>} */
+    const session = {};
+    if (this._provider === "local") session.type = "realtime";
+    session.tools = tools;
+    session.tool_choice = tools.length ? "auto" : "none";
+    this._send({ type: "session.update", session });
   }
 
   /**

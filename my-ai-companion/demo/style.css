@@ -1649,6 +1649,7 @@ body.cam-on .footer {
   grid-template-columns: 1fr 1fr;
   gap: 12px;
 }
+.field-row[hidden] { display: none; }
 
 /* ─── Chat button + badge ────────────────────────────────────────────── */
 

@@ -236,6 +236,106 @@
 
         <div class="tab-panels">
           <section class="tab-panel active" role="tabpanel">
+            <label class="field" id="provider-field">
+              <span>语音后端</span>
+              <select id="provider">
+                <option value="local" selected>本地语音服务</option>
+                <option value="openai">OpenAI Realtime（GPT Live）</option>
+                <option value="zhipu">智谱GLM-Realtime</option>
+                <option value="doubao">智谱大脑 + 豆包御姐语音</option>
+              </select>
+              <small>选择语音识别与生成的引擎。本地服务无需联网；OpenAI/智谱使用官方实时语音 API（需 API Key 并联网）。豆包模式用智谱作对话大脑、豆包 TTS 作御姐音色语音输出。</small>
+            </label>
+
+            <!-- OpenAI Realtime 直连配置：仅当语音后端选择 OpenAI 时显示 -->
+            <div id="openai-config" hidden>
+              <label class="field">
+                <span>OpenAI API Key</span>
+                <input id="openai-key" type="password" autocomplete="off" spellcheck="false" placeholder="sk-..." />
+                <small>仅保存在此浏览器本地，直接发送给官方 API。</small>
+              </label>
+              <div class="field-row">
+                <label class="field">
+                  <span>模型</span>
+                  <select id="openai-model">
+                    <option value="gpt-4o-mini-realtime-preview" selected>gpt-4o-mini-realtime-preview</option>
+                    <option value="gpt-4o-realtime-preview">gpt-4o-realtime-preview</option>
+                  </select>
+                </label>
+                <label class="field">
+                  <span>音色</span>
+                  <select id="openai-voice">
+                    <option value="alloy" selected>alloy</option>
+                    <option value="ash">ash</option>
+                    <option value="ballad">ballad</option>
+                    <option value="coral">coral</option>
+                    <option value="echo">echo</option>
+                    <option value="fable">fable</option>
+                    <option value="nova">nova</option>
+                    <option value="onyx">onyx</option>
+                    <option value="sage">sage</option>
+                    <option value="shimmer">shimmer</option>
+                    <option value="verse">verse</option>
+                  </select>
+                </label>
+              </div>
+            </div>
+
+            <!-- 智谱 GLM-Realtime 直连配置：仅当语音后端选择智谱时显示 -->
+            <div id="zhipu-config" hidden>
+              <label class="field">
+                <span>智谱 API Key</span>
+                <input id="zhipu-key" type="password" autocomplete="off" spellcheck="false" placeholder="e5c47fdd14c84faeb1bd08b160a5ee24.fSvFJoG9h2gZKerh" value="e5c47fdd14c84faeb1bd08b160a5ee24.fSvFJoG9h2gZKerh" />
+                <small>仅保存在此浏览器本地，直接发送给智谱 API。</small>
+              </label>
+              <div class="field-row">
+                <label class="field">
+                  <span>模型</span>
+                  <select id="zhipu-model">
+                    <option value="glm-realtime" selected>glm-realtime</option>
+                    <option value="glm-realtime-2025-06-02">glm-realtime-2025-06-02</option>
+                  </select>
+                </label>
+                <label class="field">
+                  <span>音色</span>
+                  <select id="zhipu-voice">
+                    <option value="tongtong" selected>tongtong（彤彤·女声，默认）</option>
+                    <option value="xiaochen">xiaochen（小陈·男声）</option>
+                    <option value="chuichui">chuichui（锤锤）</option>
+                  </select>
+                </label>
+              </div>
+            </div>
+
+            <!-- 豆包模式配置：仅当语音后端选择“智谱大脑 + 豆包御姐语音”时显示。
+                 对话大脑仍用上面的智谱凭证；语音输出用下方豆包 TTS 凭证与音色。 -->
+            <div id="doubao-config" hidden>
+              <label class="field">
+                <span>智谱 API Key（对话大脑）</span>
+                <input id="doubao-zhipu-key" type="password" autocomplete="off" spellcheck="false" placeholder="e5c47fdd14c84faeb1bd08b160a5ee24.fSvFJoG9h2gZKerh" value="e5c47fdd14c84faeb1bd08b160a5ee24.fSvFJoG9h2gZKerh" />
+                <small>豆包模式用智谱 GLM 生成文本，复用此 Key（直接发送给智谱 API）。</small>
+              </label>
+              <label class="field">
+                <span>豆包 Access Token</span>
+                <input id="doubao-token" type="password" autocomplete="off" spellcheck="false" placeholder="火山引擎语音技术控制台的 Access Token" value="3ca26a50-c2a6-4dcd-a36d-487eb1617b39" />
+                <small>仅保存在此浏览器本地，经本地服务端代理注入请求头发送给豆包 TTS。</small>
+              </label>
+              <div class="field-row">
+                <label class="field">
+                  <span>资源 ID</span>
+                  <input id="doubao-resource-id" type="text" autocomplete="off" spellcheck="false" value="seed-tts-2.0" />
+                </label>
+                <label class="field">
+                  <span>音色</span>
+                  <select id="doubao-voice">
+                    <option value="zh_female_gaolengyujie_uranus_bigtts" selected>高冷御姐（御姐音色）</option>
+                    <option value="zh_female_vv_uranus_bigtts">Vivi（温柔女声）</option>
+                    <option value="zh_female_xiaohe_uranus_bigtts">小何（亲切女声）</option>
+                  </select>
+                </label>
+              </div>
+            </div>
+
             <label class="field" id="conn-field">
               <span id="conn-label">语音服务地址</span>
               <input id="lb-url" type="text" autocomplete="off" spellcheck="false" placeholder="http://localhost:port" />
@@ -259,7 +359,7 @@
               </small>
             </label>
 
-            <div class="field-row">
+            <div class="field-row" id="voice-field-local">
               <label class="field">
                 <span>音色</span>
                 <select id="voice">

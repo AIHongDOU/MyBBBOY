@@ -45,12 +45,14 @@ import asyncio
 import json
 import logging
 import os
+from uuid import uuid4
 from urllib.parse import urlsplit, urlunsplit
 
 import auth
 import httpx
 import limiter
-from fastapi import FastAPI, HTTPException, Request, Response
+import websockets
+from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -559,6 +561,127 @@ async def session_end(request: Request):
     if sid:
         await asyncio.to_thread(limiter.end, sid)
     return {"ok": True}
+
+
+# 豆包（火山引擎）双向流式 TTS 上游地址。浏览器无法为 WebSocket 设置自定义头
+# （豆包鉴权需要 X-Api-Key / X-Api-Resource-Id），所以经本代理中转：浏览器连到
+# /api/doubao-tts，把 token/resourceId 放在查询参数里，代理代为注入请求头并双向
+# 转发二进制帧（V3 协议的开销全部在浏览器端完成，这里只做透明中继）。
+DOUBAO_TTS_URL = "wss://openspeech.bytedance.com/api/v3/tts/bidirection"
+
+
+# 记忆提炼用的智谱 chat completions 上游。浏览器直连第三方旧接口存在 CORS 风险，
+# 故经本代理转发（与 /api/search 同模式）：浏览器把智谱 key 放在 JSON 里发来，
+# 代理代为注入 Authorization 头。key 只用于这一次请求，不落盘。
+ZHIPU_CHAT_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+
+
+class RefineRequest(BaseModel):
+    key: str
+    user: str
+    assistant: str
+
+
+@app.post("/api/memory/refine")
+async def memory_refine(req: RefineRequest):
+    """把一轮对话交给智谱 chat completions 提炼，返回长期记忆事实列表。
+
+    请求体重用浏览器里已有的智谱 key（本地个人使用，key 仅存于浏览器，
+    经同源代理转发一次，不落盘）。返回 { facts: [string, ...] }。"""
+    key = (req.key or "").strip()
+    if not key:
+        raise HTTPException(status_code=400, detail="Empty key.")
+    system = (
+        "你是小姚的记忆整理助手。下面是一轮你（小姚）和用户的对话。请提炼出值得长期记住的用户信息："
+        "偏好、爱好、个人基本情况（工作/学习/家庭/所在地）、计划、以及用户说过的重要事实。"
+        "只保留有长期价值的信息，忽略寒暄、一次性问题和纯情绪表达。"
+        '用"你"指代用户，从"小姚记得"的角度简洁陈述，例如"你喜欢喝咖啡"、"你最近在准备考研"。'
+        '严格只输出一个 JSON 字符串数组，如 ["…","…"]，不要输出任何其他文字。'
+    )
+    payload = {
+        "model": "glm-4-flash",
+        "temperature": 0.2,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": f"用户：{req.user}\n小姚：{req.assistant}"},
+        ],
+    }
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as http:
+            resp = await http.post(ZHIPU_CHAT_URL, headers=headers, json=payload)
+    except httpx.RequestError as exc:
+        logger.warning("zhipu refine unreachable: %r", exc)
+        raise HTTPException(status_code=502, detail="Memory refine provider unreachable.")
+    if resp.status_code != 200:
+        logger.warning("zhipu refine error %s: %s", resp.status_code, resp.text[:300])
+        raise HTTPException(status_code=502, detail="Memory refine provider error.")
+    content = ((resp.json().get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+    return {"facts": content}
+
+
+@app.websocket("/api/doubao-tts")
+async def doubao_tts(ws: WebSocket):
+    """Transparent WebSocket relay to 豆包双向流式 TTS, injecting the auth headers
+    the browser can't set. Query params: `token` (X-Api-Key), `resourceId`.
+    Binary + text frames are forwarded verbatim in both directions."""
+    await ws.accept()
+    token = (ws.query_params.get("token") or "").strip()
+    resource_id = (ws.query_params.get("resourceId") or "seed-tts-2.0").strip()
+    if not token:
+        await ws.send_text(json.dumps({"event": 51, "error": "missing token"}))
+        await ws.close()
+        return
+    headers = {
+        "X-Api-Key": token,
+        "X-Api-Resource-Id": resource_id,
+        "X-Api-Connect-Id": uuid4().hex,
+        "X-Control-Require-Usage-Tokens-Return": "*",
+    }
+    up_bytes = 0
+    down_bytes = 0
+    try:
+        async with websockets.connect(
+            DOUBAO_TTS_URL, additional_headers=headers, max_size=None, ping_interval=None
+        ) as up:
+            async def browser_to_up():
+                nonlocal up_bytes
+                while True:
+                    msg = await ws.receive()
+                    mtype = msg.get("type")
+                    if mtype == "websocket.disconnect":
+                        break
+                    if "bytes" in msg:
+                        up_bytes += len(msg["bytes"])
+                        await up.send(msg["bytes"])
+                    elif "text" in msg:
+                        up_bytes += len(msg["text"])
+                        await up.send(msg["text"])
+
+            async def up_to_browser():
+                nonlocal down_bytes
+                async for msg in up:
+                    if isinstance(msg, (bytes, bytearray)):
+                        down_bytes += len(msg)
+                        await ws.send_bytes(bytes(msg))
+                    elif isinstance(msg, str):
+                        down_bytes += len(msg)
+                        await ws.send_text(msg)
+
+            await asyncio.gather(browser_to_up(), up_to_browser())
+    except WebSocketDisconnect:
+        pass
+    except websockets.exceptions.ConnectionClosed as exc:
+        # 豆包合成完成后会主动关闭上游连接，属正常收尾，不是错误。
+        logger.info("doubao tts proxy: upstream closed (code=%s)", getattr(exc, "code", None))
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("doubao tts proxy error: %r", exc)
+        try:
+            await ws.close()
+        except Exception:
+            pass
+    finally:
+        print(f"[doubao-proxy] up={up_bytes}B down={down_bytes}B", flush=True)
 
 
 # Static front-end. Registered last so the /api routes win. `html=True` serves

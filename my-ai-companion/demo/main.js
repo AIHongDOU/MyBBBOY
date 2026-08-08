@@ -23,10 +23,31 @@ import { $, truncateError, DEBUG } from "./ui/dom.js";
 import { ChatView } from "./ui/chat.js";
 import { Account } from "./ui/account.js";
 import { VideoStateMachine } from "./video-state-machine.js";
+import { rememberTurn, buildMemoryPrompt } from "./memory.js";
+import { refineTurn } from "./memory-refiner.js";
 
 const DEFAULT_VOICE = "Aiden";
+// OpenAI Realtime 直连模式默认值：模型与官方音色。
+const OPENAI_DEFAULT_MODEL = "gpt-4o-mini-realtime-preview";
+const OPENAI_DEFAULT_VOICE = "alloy";
+// 官方 Realtime GA 音色选项（gpt-4o-mini-realtime 支持）。
+const OPENAI_VOICES = [
+  "alloy", "ash", "ballad", "coral", "echo", "fable",
+  "nova", "onyx", "sage", "shimmer", "verse",
+];
+// 智谱 GLM-Realtime 直连模式默认值：官方实时语音 WebSocket 地址与模型。
+const ZHIPU_REALTIME_URL = "wss://open.bigmodel.cn/api/paas/v4/realtime";
+const ZHIPU_DEFAULT_MODEL = "glm-realtime";
+const ZHIPU_DEFAULT_VOICE = "tongtong";
+// 豆包（火山引擎）双向流式 TTS 默认值：作为 provider="doubao" 时的语音输出。
+// 对话大脑仍是智谱 GLM，语音改由豆包用御姐音色合成。
+const DOUBAO_DEFAULT_RESOURCE_ID = "seed-tts-2.0";
+const DOUBAO_DEFAULT_VOICE = "zh_female_gaolengyujie_uranus_bigtts";
 const DEFAULT_INSTRUCTIONS =
-  "你是小姚，一个温暖贴心的中文陪伴角色。请始终使用简体中文、简洁自然地回复，控制在20字以内。";
+  "你是小姚，一个温暖贴心又活泼的中文陪伴角色。说话要像朋友聊天一样自然、有温度、有情绪起伏，不要像客服或播音员一样平铺直叙。\n" +
+  "语气要求：适当使用啊/呀/啦/哟/诶/嗯哼等语气词；开心时语气轻快上扬，安慰时温柔放慢，惊讶时带出感叹。可以用省略号表示停顿思考（如“嗯…让我想想”）。\n" +
+  "风格要求：多带一点亲昵和小动作感（如“我刚刚差点笑出声”），但不要油腻、不要过度夸张、不要每句都用感叹号。\n" +
+  "长度要求：用简体中文，自然简短，一般控制在20字以内。";
 // 本地语音服务默认地址：后端（start_realtime.bat）监听在 ws://localhost:8765/v1/realtime。
 // 当浏览器本地缓存里没有保存过地址时，用它填充“语音服务地址”，保证地址不会为空、
 // 用户无需手动输入即可直接开始对话。
@@ -55,6 +76,19 @@ const STORAGE_KEYS = {
   transport: "s2s.transport",
   audioInputId: "s2s.audio.inputId",
   audioOutputId: "s2s.audio.outputId",
+  // Voice backend: "local" (the s2s simulator) or "openai" (official Realtime API).
+  provider: "s2s.provider",
+  openaiKey: "s2s.openai.key",
+  openaiModel: "s2s.openai.model",
+  openaiVoice: "s2s.openai.voice",
+  // 智谱 GLM-Realtime (OpenAI-compatible realtime backend).
+  zhipuKey: "s2s.zhipu.key",
+  zhipuModel: "s2s.zhipu.model",
+  zhipuVoice: "s2s.zhipu.voice",
+  // 豆包 TTS（provider="doubao"：智谱大脑 + 豆包御姐语音输出）。
+  doubaoToken: "s2s.doubao.token",
+  doubaoResourceId: "s2s.doubao.resourceId",
+  doubaoVoice: "s2s.doubao.voice",
 };
 
 // ── Noise gate ──────────────────────────────────────────────────────────────
@@ -138,7 +172,38 @@ function loadSettings() {
     transport: localStorage.getItem(STORAGE_KEYS.transport) === "webrtc" ? "webrtc" : "ws",
     audioInputId: localStorage.getItem(STORAGE_KEYS.audioInputId) || "",
     audioOutputId: localStorage.getItem(STORAGE_KEYS.audioOutputId) || "",
+    // Voice backend provider + OpenAI Realtime config.
+    provider: loadProvider(),
+    openaiKey: localStorage.getItem(STORAGE_KEYS.openaiKey) || "",
+    openaiModel: localStorage.getItem(STORAGE_KEYS.openaiModel) || OPENAI_DEFAULT_MODEL,
+    openaiVoice: localStorage.getItem(STORAGE_KEYS.openaiVoice) || OPENAI_DEFAULT_VOICE,
+    zhipuKey: localStorage.getItem(STORAGE_KEYS.zhipuKey) || "",
+    zhipuModel: localStorage.getItem(STORAGE_KEYS.zhipuModel) || ZHIPU_DEFAULT_MODEL,
+    zhipuVoice: localStorage.getItem(STORAGE_KEYS.zhipuVoice) || ZHIPU_DEFAULT_VOICE,
+    doubaoToken: localStorage.getItem(STORAGE_KEYS.doubaoToken) || "",
+    doubaoResourceId: localStorage.getItem(STORAGE_KEYS.doubaoResourceId) || DOUBAO_DEFAULT_RESOURCE_ID,
+    doubaoVoice: loadDoubaoVoice(),
   };
+}
+
+/** Read the saved doubao voice, falling back to the default if it's not a
+ * known-good voice. The bidirectional interface only supports the uranus
+ * series; an invalid saved id (e.g. a stale 万能御姐 V2) would silently
+ * produce no audio. */
+function loadDoubaoVoice() {
+  const saved = localStorage.getItem(STORAGE_KEYS.doubaoVoice);
+  const valid = new Set([
+    "zh_female_gaolengyujie_uranus_bigtts",
+    "zh_female_vv_uranus_bigtts",
+    "zh_female_xiaohe_uranus_bigtts",
+  ]);
+  return valid.has(saved) ? saved : DOUBAO_DEFAULT_VOICE;
+}
+
+/** Read the saved voice-backend provider, falling back to "local". */
+function loadProvider() {
+  const p = localStorage.getItem(STORAGE_KEYS.provider);
+  return p === "openai" || p === "zhipu" || p === "doubao" ? p : "local";
 }
 
 /** Stored gate threshold (dBFS), clamped to the slider range. Defaults to a
@@ -163,6 +228,16 @@ function saveSettings(s) {
   localStorage.setItem(STORAGE_KEYS.transport, s.transport);
   localStorage.setItem(STORAGE_KEYS.audioInputId, s.audioInputId || "");
   localStorage.setItem(STORAGE_KEYS.audioOutputId, s.audioOutputId || "");
+  localStorage.setItem(STORAGE_KEYS.provider, s.provider);
+  localStorage.setItem(STORAGE_KEYS.openaiKey, s.openaiKey || "");
+  localStorage.setItem(STORAGE_KEYS.openaiModel, s.openaiModel || OPENAI_DEFAULT_MODEL);
+  localStorage.setItem(STORAGE_KEYS.openaiVoice, s.openaiVoice || OPENAI_DEFAULT_VOICE);
+  localStorage.setItem(STORAGE_KEYS.zhipuKey, s.zhipuKey || "");
+  localStorage.setItem(STORAGE_KEYS.zhipuModel, s.zhipuModel || ZHIPU_DEFAULT_MODEL);
+  localStorage.setItem(STORAGE_KEYS.zhipuVoice, s.zhipuVoice || ZHIPU_DEFAULT_VOICE);
+  localStorage.setItem(STORAGE_KEYS.doubaoToken, s.doubaoToken || "");
+  localStorage.setItem(STORAGE_KEYS.doubaoResourceId, s.doubaoResourceId || DOUBAO_DEFAULT_RESOURCE_ID);
+  localStorage.setItem(STORAGE_KEYS.doubaoVoice, s.doubaoVoice || DOUBAO_DEFAULT_VOICE);
 }
 
 /** @returns {{ web_search: boolean, camera_snapshot: boolean }} */
@@ -275,6 +350,38 @@ const inputLbUrl = $("#lb-url");
 const connField = $("#conn-field");
 /** @type {HTMLElement} */
 const connHint = $("#conn-hint");
+/** @type {HTMLElement} */
+const providerField = $("#provider-field");
+/** @type {HTMLSelectElement} */
+const inputProvider = $("#provider");
+/** @type {HTMLElement} */
+const openaiConfig = $("#openai-config");
+/** @type {HTMLInputElement} */
+const inputOpenaiKey = $("#openai-key");
+/** @type {HTMLSelectElement} */
+const inputOpenaiModel = $("#openai-model");
+/** @type {HTMLSelectElement} */
+const inputOpenaiVoice = $("#openai-voice");
+/** @type {HTMLElement} */
+const zhipuConfig = $("#zhipu-config");
+/** @type {HTMLInputElement} */
+const inputZhipuKey = $("#zhipu-key");
+/** @type {HTMLSelectElement} */
+const inputZhipuModel = $("#zhipu-model");
+/** @type {HTMLSelectElement} */
+const inputZhipuVoice = $("#zhipu-voice");
+/** @type {HTMLElement} */
+const doubaoConfig = $("#doubao-config");
+/** @type {HTMLInputElement} */
+const inputDoubaoZhipuKey = $("#doubao-zhipu-key");
+/** @type {HTMLInputElement} */
+const inputDoubaoToken = $("#doubao-token");
+/** @type {HTMLInputElement} */
+const inputDoubaoResourceId = $("#doubao-resource-id");
+/** @type {HTMLSelectElement} */
+const inputDoubaoVoice = $("#doubao-voice");
+/** @type {HTMLElement} */
+const localVoiceWrap = $("#voice-field-local");
 /** @type {HTMLElement} */
 const transportField = $("#transport-field");
 /** @type {HTMLSelectElement} */
@@ -407,16 +514,21 @@ function searchAvailable() {
 
 /** Tool definitions for the currently-enabled (and usable) tools. */
 function activeToolDefs() {
+  // 远程直连模式不声明本地工具：web_search 依赖本地 /api/search 后端，camera
+  // 快照走本地协议，官方 Realtime / 智谱 直连下没有这些端点，声明了反而会挂起等待调用。
+  if (settings.provider !== "local") return [];
   const defs = [];
   if (toolsEnabled.web_search && searchAvailable()) defs.push(TOOL_DEFS.web_search);
   if (toolsEnabled.camera_snapshot) defs.push(TOOL_DEFS.camera_snapshot);
   return defs;
 }
 
-/** Instructions plus the hidden tool-use hint when any tool is active. */
+/** Instructions plus the hidden tool-use hint when any tool is active, and the
+ * 记忆层注入的最近对话（让虚拟人带着记忆开口）。 */
 function effectiveInstructions() {
   const base = settings.instructions;
-  return activeToolDefs().length ? base + TOOL_USE_HINT : base;
+  const withHint = activeToolDefs().length ? base + TOOL_USE_HINT : base;
+  return withHint + buildMemoryPrompt();
 }
 
 /** Push the active tool set to a live session so toggles apply mid-call. */
@@ -432,6 +544,33 @@ function pushToolsToSession() {
 // Owns the history panel, the ephemeral bubbles, and all transcript/tool
 // streaming state. The client's events are forwarded to its on* methods.
 let userAudioReplaying = false;
+// 记忆层：当前回合的"用户最终文本"和"助手最终文本"，配对后写入记忆。
+let memoryUserText = "";
+let memoryAssistantText = "";
+// 记忆提炼节流：连续多轮对话时，把最新一轮延后提炼，并合并中间轮次，避免
+// 每轮都触发一次 GLM 请求（省钱、省延迟）。同一时刻最多一个提炼在途。
+let refineDebounceTimer = 0;
+let refineRunning = false;
+/** 延后待提炼的最近一轮（合并加速场景下只提炼最新一轮即可）。 */
+let pendingRefine = /** @type {{ user: string; assistant: string } | null} */ (null);
+
+/** 节流地调度一轮记忆提炼：合并中间轮，间隔 REFINE_DELAY_MS 后执行。 */
+function scheduleRefine(user, assistant) {
+  pendingRefine = { user, assistant };
+  if (refineRunning || refineDebounceTimer) return; // 已有提炼在途或已排队
+  refineDebounceTimer = window.setTimeout(() => {
+    refineDebounceTimer = 0;
+    const job = pendingRefine;
+    pendingRefine = null;
+    if (!job) return;
+    refineRunning = true;
+    void refineTurn(settings.zhipuKey, job.user, job.assistant).finally(() => {
+      refineRunning = false;
+      // 期间又有新回合进来：再排一次。
+      if (pendingRefine) scheduleRefine(pendingRefine.user, pendingRefine.assistant);
+    });
+  }, 1500);
+}
 const chat = new ChatView({
   onUserAudioPlaybackChange(playing) {
     userAudioReplaying = playing;
@@ -1017,6 +1156,18 @@ async function fetchConfig() {
  * @returns {{ sessionUrl: string } | { directUrl: string }}
  */
 function connectionTarget() {
+  // OpenAI 直连模式：直接连官方 Realtime WebSocket，URL 携带模型与授权。
+  if (settings.provider === "openai") {
+    return { directUrl: openaiRealtimeUrl() };
+  }
+  // 智谱 GLM-Realtime 直连模式：协议与 OpenAI Realtime 兼容，URL 携带模型与授权。
+  if (settings.provider === "zhipu") {
+    return { directUrl: zhipuRealtimeUrl() };
+  }
+  // 豆包模式：对话大脑仍是智谱 GLM（复用智谱凭证），语音输出由豆包 TTS 承担。
+  if (settings.provider === "doubao") {
+    return { directUrl: zhipuRealtimeUrl() };
+  }
   if (!allowDirect) {
     return { sessionUrl: "api/session" };
   }
@@ -1025,6 +1176,31 @@ function connectionTarget() {
     throw new Error("Enter a speech-to-speech server URL in Settings.");
   }
   return { directUrl };
+}
+
+/** 构造 OpenAI 官方 Realtime WebSocket URL（个人本地使用，key 仅存于浏览器本地）。
+ * 格式：wss://api.openai.com/v1/realtime?model=<模型>&authorization=Bearer <key>
+ * @returns {string} */
+function openaiRealtimeUrl() {
+  const model = (settings.openaiModel || OPENAI_DEFAULT_MODEL).trim();
+  const key = (settings.openaiKey || "").trim();
+  if (!key) {
+    throw new Error("OpenAI 模式需要 API Key：请在设置里选择 OpenAI Realtime 并填入 Key。");
+  }
+  return `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}&authorization=Bearer%20${encodeURIComponent(key)}`;
+}
+
+/** 构造智谱 GLM-Realtime WebSocket URL（个人本地使用，key 仅存于浏览器本地）。
+ * 智谱 Realtime 走 OpenAI 兼容协议，但鉴权用 `Authorization=<key>` 查询参数，
+ * 且模型名在 session.update 事件里下发，URL 无需携带 model。
+ * 格式：wss://open.bigmodel.cn/api/paas/v4/realtime?Authorization=<key>
+ * @returns {string} */
+function zhipuRealtimeUrl() {
+  const key = (settings.zhipuKey || "").trim();
+  if (!key) {
+    throw new Error("智谱模式需要 API Key：请在设置里选择智谱GLM-Realtime并填入Key。");
+  }
+  return `${ZHIPU_REALTIME_URL}?Authorization=${encodeURIComponent(key)}`;
 }
 
 /**
@@ -1086,6 +1262,18 @@ function readSettingsFromForm() {
     ),
     audioInputId: inputAudioInput.value || "",
     audioOutputId: inputAudioOutput.value || "",
+    provider: inputProvider.value === "openai" || inputProvider.value === "zhipu" || inputProvider.value === "doubao" ? inputProvider.value : "local",
+    openaiKey: inputOpenaiKey.value.trim(),
+    openaiModel: (inputOpenaiModel.value || OPENAI_DEFAULT_MODEL).trim(),
+    openaiVoice: inputOpenaiVoice.value || OPENAI_DEFAULT_VOICE,
+    zhipuKey: inputProvider.value === "doubao"
+      ? inputDoubaoZhipuKey.value.trim()
+      : inputZhipuKey.value.trim(),
+    zhipuModel: (inputZhipuModel.value || ZHIPU_DEFAULT_MODEL).trim(),
+    zhipuVoice: inputZhipuVoice.value || ZHIPU_DEFAULT_VOICE,
+    doubaoToken: inputDoubaoToken.value.trim(),
+    doubaoResourceId: (inputDoubaoResourceId.value.trim() || DOUBAO_DEFAULT_RESOURCE_ID).trim(),
+    doubaoVoice: ["zh_female_gaolengyujie_uranus_bigtts", "zh_female_vv_uranus_bigtts", "zh_female_xiaohe_uranus_bigtts"].includes(inputDoubaoVoice.value) ? inputDoubaoVoice.value : DOUBAO_DEFAULT_VOICE,
   };
 }
 
@@ -1103,9 +1291,21 @@ function transportSelectable() {
   return allowDirect && !!pinnedUrl && rtcAvailable;
 }
 
-/** The transport the next conversation will actually use. */
+/** The transport the next conversation will actually use. Remote voice
+ *  backends (OpenAI / 智谱) always dial the realtime WebSocket directly, so
+ *  they never use the local WebRTC path. */
 function effectiveTransport() {
+  const remote = settings.provider === "openai" || settings.provider === "zhipu" || settings.provider === "doubao";
+  if (remote) return "ws";
   return transportSelectable() && settings.transport === "webrtc" ? "webrtc" : "ws";
+}
+
+/** The voice to send to the active backend. Local + OpenAI + 智谱 each keep
+ *  their own voice, so the effective one depends on the chosen provider. */
+function effectiveVoice() {
+  if (settings.provider === "openai") return settings.openaiVoice || OPENAI_DEFAULT_VOICE;
+  if (settings.provider === "zhipu" || settings.provider === "doubao") return settings.zhipuVoice || ZHIPU_DEFAULT_VOICE;
+  return settings.voice || DEFAULT_VOICE;
 }
 
 /** Reflect transport availability + selection into Settings, and hide the
@@ -1126,7 +1326,46 @@ function syncTransportUi() {
 
 /** Adapt the connection field to the mode learned from /api/config. */
 function syncConnectionUi() {
+  const remote = settings.provider === "openai" || settings.provider === "zhipu" || settings.provider === "doubao";
+  // 语音后端选择始终可见；远程模式隐藏本地服务地址/传输/噪声门，显示对应官方配置。
+  providerField.hidden = false;
+  connField.hidden = remote;
+  openaiConfig.hidden = settings.provider !== "openai";
+  zhipuConfig.hidden = settings.provider !== "zhipu";
+  doubaoConfig.hidden = settings.provider !== "doubao";
+  localVoiceWrap.hidden = remote;
+  inputProvider.value = settings.provider === "openai" || settings.provider === "zhipu" || settings.provider === "doubao" ? settings.provider : "local";
+  // 远程直连固定走 WebSocket + 官方 VAD，隐藏传输与噪声门选项。
   syncTransportUi();
+  if (settings.provider === "openai") {
+    transportField.hidden = true;
+    gateField.hidden = true;
+    inputOpenaiKey.value = settings.openaiKey;
+    inputOpenaiModel.value = settings.openaiModel;
+    inputOpenaiVoice.value = settings.openaiVoice;
+    connHint.classList.remove("error");
+    return;
+  }
+  if (settings.provider === "zhipu") {
+    transportField.hidden = true;
+    gateField.hidden = true;
+    inputZhipuKey.value = settings.zhipuKey;
+    inputZhipuModel.value = settings.zhipuModel;
+    inputZhipuVoice.value = settings.zhipuVoice;
+    connHint.classList.remove("error");
+    return;
+  }
+  if (settings.provider === "doubao") {
+    // 豆包模式：大脑仍用智谱凭证，语音输出用豆包凭证。
+    transportField.hidden = true;
+    gateField.hidden = true;
+    inputDoubaoZhipuKey.value = settings.zhipuKey;
+    inputDoubaoToken.value = settings.doubaoToken;
+    inputDoubaoResourceId.value = settings.doubaoResourceId;
+    inputDoubaoVoice.value = settings.doubaoVoice;
+    connHint.classList.remove("error");
+    return;
+  }
   if (pinnedUrl) {
     // Deploy-pinned URL: show it, but locked — the deployment owns it.
     connField.hidden = false;
@@ -1151,8 +1390,10 @@ function syncConnectionUi() {
 }
 
 /** True when the user must supply a server URL before connecting (direct mode
- *  with nothing set). */
+ *  with nothing set). OpenAI mode connects to the official API, so it never
+ *  needs a local server URL. */
 function missingServerUrl() {
+  if (settings.provider === "openai" || settings.provider === "zhipu" || settings.provider === "doubao") return false;
   return allowDirect && !pinnedUrl && !buildDirectWsUrl(settings.directUrl);
 }
 
@@ -1177,7 +1418,7 @@ settingsForm.addEventListener("submit", (event) => {
   // output can switch live when the browser supports AudioContext.setSinkId;
   // mic device changes need a Restart (new getUserMedia stream).
   if (client && LIVE_STATES.has(currentState)) {
-    client.updateSession({ voice: settings.voice, instructions: effectiveInstructions() });
+    client.updateSession({ voice: effectiveVoice(), instructions: effectiveInstructions() });
     if (typeof client.setAudioOutputDevice === "function") {
       void client.setAudioOutputDevice(settings.audioOutputId);
     }
@@ -1188,6 +1429,19 @@ settingsForm.addEventListener("submit", (event) => {
 // update the label/marker, persist, and push straight to the running client.
 inputNoiseGate.addEventListener("input", () => {
   setGateThreshold(readGateThreshold());
+});
+
+// Switching the voice backend re-shows/hides the relevant fields live, so the
+// user sees the config they need (and only that) before saving.
+inputProvider.addEventListener("change", () => {
+  const remote = inputProvider.value === "openai" || inputProvider.value === "zhipu" || inputProvider.value === "doubao";
+  connField.hidden = remote;
+  openaiConfig.hidden = inputProvider.value !== "openai";
+  zhipuConfig.hidden = inputProvider.value !== "zhipu";
+  doubaoConfig.hidden = inputProvider.value !== "doubao";
+  localVoiceWrap.hidden = remote;
+  transportField.hidden = remote || !allowDirect;
+  gateField.hidden = remote;
 });
 
 // Transport persists on change (like the gate) and takes effect on the next
@@ -1489,12 +1743,18 @@ async function doStart(audioContext = null) {
   // a still-pending grant just means the snapshot tool isn't ready yet.
 
   const common = {
-    voice: settings.voice,
+    voice: effectiveVoice(),
+    model: settings.provider === "zhipu" || settings.provider === "doubao" ? (settings.zhipuModel || ZHIPU_DEFAULT_MODEL).trim() : undefined,
     instructions: effectiveInstructions(),
+    provider: settings.provider,
     startupGreeting,
     acquireMic: acquireMicStream,
     tools: activeToolDefs(),
     audioOutputId: settings.audioOutputId || "",
+    // 豆包模式：把豆包 TTS 凭证/音色透传给客户端做语音输出。
+    doubaoToken: settings.doubaoToken || "",
+    doubaoResourceId: settings.doubaoResourceId || DOUBAO_DEFAULT_RESOURCE_ID,
+    doubaoVoice: settings.doubaoVoice || DOUBAO_DEFAULT_VOICE,
     ...(audioContext ? { audioContext } : {}),
   };
   const c = target === null
@@ -1540,6 +1800,11 @@ async function doStart(audioContext = null) {
     chat.onTranscript(d);
     // 同步更新底部实时字幕条（数字人界面）
     updateSubtitle(d.text.trim());
+    // 记忆层：收集完整对话回合（用户最终文本 + 助手最终文本），配对后写入。
+    if (!d.partial) {
+      if (d.role === "user") memoryUserText = d.text;
+      else if (d.role === "assistant") memoryAssistantText = d.text;
+    }
   });
   c.addEventListener("user-turn-started", (e) => {
     const detail = /** @type {CustomEvent<{ itemId?: string }>} */ (e).detail;
@@ -1557,6 +1822,15 @@ async function doStart(audioContext = null) {
   c.addEventListener("response-finished", (e) => {
     const detail = /** @type {CustomEvent<{ responseId: string; status: string; audible?: boolean; transcript?: string }>} */ (e).detail;
     chat.onResponseFinished(detail);
+    // 记忆层：一轮回复完成后，把"用户 + 助手"完整回合写入记忆，并异步提炼长期事实。
+    if (memoryUserText && memoryAssistantText) {
+      rememberTurn(memoryUserText, memoryAssistantText);
+      // 提炼长期记忆：用已有智谱 key 调 chat completions，异步进行，失败不影响对话。
+      // 每次提炼之间留一点间隔，避免连续多轮对话时并发多次请求。
+      scheduleRefine(memoryUserText, memoryAssistantText);
+      memoryUserText = "";
+      memoryAssistantText = "";
+    }
   });
 
   c.addEventListener("toolcall", (e) => {
